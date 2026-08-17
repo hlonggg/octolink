@@ -1,6 +1,6 @@
 """
-Octolink Code Monitor Bot - v3.3
-Sửa login với thời gian chờ JS
+Octolink Code Monitor Bot - v3.4
+Dựa trên file dmm.py - cơ chế login và scrape ổn định
 """
 
 import asyncio
@@ -25,7 +25,7 @@ LOGIN_URL      = "https://kiemcom.site/login"
 TASKS_URL      = "https://kiemcom.site/dashboard/tasks"
 TARGET_CHAT_ID = "-1003948095853"
 
-CHECK_INTERVAL  = 300     # giây (5 phút)
+CHECK_INTERVAL  = 300     # giây
 MAX_RETRIES     = 3
 RETRY_DELAY     = 10
 PAGE_TIMEOUT    = 30_000
@@ -124,71 +124,94 @@ async def ensure_logged_in(page: Page) -> bool:
 
     if _logged_in:
         try:
-            await page.goto(TASKS_URL, wait_until="domcontentloaded", timeout=15_000)
-            await asyncio.sleep(2)
+            await page.goto(TASKS_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+            await asyncio.sleep(1)
             if "/login" not in page.url:
-                log.info("Session OK")
+                log.info(f"Session OK → {page.url}")
                 return True
             log.info("Session hết hạn, đăng nhập lại...")
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"Kiểm tra session lỗi: {e}")
         _logged_in = False
 
-    log.info("Đăng nhập...")
+    log.info("Mở trang login...")
     await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
 
     # Chờ JS render
-    await asyncio.sleep(5)
+    await asyncio.sleep(3)
 
-    # Chờ form login xuất hiện
+    # Chờ form load
     try:
-        await page.wait_for_selector('#email', state='visible', timeout=30_000)
-        await page.wait_for_selector('#password', state='visible', timeout=30_000)
-        log.info("Form login đã load")
+        await page.wait_for_selector("#email", state="visible", timeout=PAGE_TIMEOUT)
+        await page.wait_for_selector("#password", state="visible", timeout=PAGE_TIMEOUT)
     except PlaywrightTimeout:
-        log.error("Form login không xuất hiện sau 30s")
-        try:
-            html = await page.content()
-            log.info(f"HTML đầu trang (500 ký tự): {html[:500]}")
-        except Exception:
-            pass
+        log.error("Form login không xuất hiện!")
         return False
 
     # Điền email
-    await page.locator('#email').click()
-    await page.locator('#email').fill("")
-    await page.locator('#email').type(MY_EMAIL, delay=50)
+    await page.locator("#email").click()
+    await page.locator("#email").fill("")
+    await page.locator("#email").type(MY_EMAIL, delay=30)
 
     # Điền password
-    await page.locator('#password').click()
-    await page.locator('#password').fill("")
-    await page.locator('#password').type(MY_PASSWORD, delay=50)
+    await page.locator("#password").click()
+    await page.locator("#password").fill("")
+    await page.locator("#password").type(MY_PASSWORD, delay=30)
 
-    await asyncio.sleep(random.uniform(0.5, 1.0))
+    await asyncio.sleep(random.uniform(0.4, 0.8))
 
-    # Click nút đăng nhập
-    try:
-        btn = page.locator('button[type="submit"]:has-text("Đăng nhập ngay")')
-        if await btn.count() > 0:
-            await btn.click()
-        else:
-            await page.click('button[type="submit"]')
-        log.info("Đã click nút đăng nhập")
-    except Exception as e:
-        log.warning(f"Click button lỗi: {e}")
-        await page.locator('#password').press("Enter")
+    # Click nút submit
+    submitted = False
+    for btn_selector in [
+        "button[type='submit']",
+        "button:has-text('Đăng nhập')",
+        "button:has-text('Đăng nhập ngay')",
+        "input[type='submit']",
+    ]:
+        try:
+            btn = page.locator(btn_selector)
+            if await btn.count() > 0:
+                await btn.first.click()
+                submitted = True
+                log.info(f"Click submit: {btn_selector}")
+                break
+        except Exception:
+            continue
+
+    if not submitted:
+        log.info("Không tìm thấy nút submit, thử Enter...")
+        await page.locator("#password").press("Enter")
 
     # Chờ thoát login
-    deadline = asyncio.get_event_loop().time() + 30
+    deadline = asyncio.get_event_loop().time() + 20
     while asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0.5)
-        if "/login" not in page.url:
-            log.info(f"Đăng nhập thành công → {page.url}")
-            _logged_in = True
-            return True
+        current = page.url
+        if "/login" not in current:
+            log.info(f"Thoát login → {current}")
+            break
+        # Kiểm tra lỗi
+        err_sel = ".error, .alert-danger, [class*='error'], [class*='invalid']"
+        try:
+            err = page.locator(err_sel)
+            if await err.count() > 0:
+                err_text = await err.first.inner_text()
+                log.error(f"Login thất bại: {err_text.strip()}")
+                return False
+        except Exception:
+            pass
+    else:
+        log.error(f"Timeout 20s, vẫn ở login: {page.url}")
+        return False
 
-    log.error("Login timeout 30s, vẫn ở /login")
-    return False
+    await asyncio.sleep(0.5)
+    if "/login" in page.url:
+        log.error(f"Vẫn ở login sau khi submit: {page.url}")
+        return False
+
+    log.info(f"✅ Đăng nhập thành công → {page.url}")
+    _logged_in = True
+    return True
 
 # ======================== SCRAPE ========================
 CODE_SELECTORS = [
@@ -207,18 +230,20 @@ def looks_like_code(t: str) -> bool:
 async def _scrape_codes(page: Page) -> list[str]:
     if "/tasks" not in page.url:
         await page.goto(TASKS_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
 
     if "/login" in page.url:
-        raise RuntimeError("Redirect về login")
+        raise RuntimeError(f"Bị redirect về login: {page.url}")
 
     # Chờ element
+    target_sel = CODE_SELECTORS[0]
     try:
-        await page.wait_for_selector(CODE_SELECTORS[0], timeout=15_000)
+        await page.wait_for_selector(target_sel, timeout=10_000)
     except PlaywrightTimeout:
         for sel in CODE_SELECTORS[1:]:
             try:
                 await page.wait_for_selector(sel, timeout=5_000)
+                target_sel = sel
                 break
             except PlaywrightTimeout:
                 continue
@@ -241,11 +266,12 @@ async def _scrape_codes(page: Page) -> list[str]:
 
     # Fallback regex
     if not codes:
+        log.warning("JS query rỗng, fallback regex HTML...")
         html = await page.content()
         candidates = re.findall(r'>([A-Z0-9][A-Z0-9\-_]{3,19})<', html)
         codes = list(dict.fromkeys(c for c in candidates if looks_like_code(c)))
 
-    log.info(f"Tìm được {len(codes)} mã")
+    log.info(f"Tìm được {len(codes)} mã.")
     return codes
 
 # ======================== MAIN SCRAPE ========================
@@ -253,7 +279,7 @@ async def get_octolink_codes() -> list[str]:
     global consecutive_failures, _logged_in
 
     for attempt in range(1, MAX_RETRIES + 1):
-        log.info(f"Quét lần {attempt}/{MAX_RETRIES}")
+        log.info(f"Quét lần {attempt}/{MAX_RETRIES}...")
         page = None
         try:
             _, ctx = await get_browser_context()
@@ -278,14 +304,15 @@ async def get_octolink_codes() -> list[str]:
             except Exception:
                 pass
 
-            if "closed" in str(e).lower():
+            if "Target page, context or browser has been closed" in str(e):
                 await close_browser()
 
             if attempt < MAX_RETRIES:
+                log.info(f"Chờ {RETRY_DELAY}s...")
                 await asyncio.sleep(RETRY_DELAY)
 
     consecutive_failures += 1
-    log.error(f"Thất bại {consecutive_failures} lần")
+    log.error(f"Thất bại {consecutive_failures} lần liên tiếp.")
     return []
 
 # ======================== TELEGRAM ========================
@@ -294,10 +321,13 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     codes = await get_octolink_codes()
 
     if not codes:
-        await update.message.reply_text("❌ Không lấy được mã. Kiểm tra mật khẩu hoặc site đổi giao diện.")
+        await update.message.reply_text(
+            "❌ Không lấy được mã.\n"
+            "Kiểm tra: mật khẩu sai, IP bị chặn, hoặc site đổi giao diện."
+        )
         return
 
-    lines = "\n".join(f"🎯 `{c}`" for i, c in enumerate(codes, 1))
+    lines = "\n".join(f"🎯 Mã {i}: `{c}`" for i, c in enumerate(codes, 1))
     await update.message.reply_text(
         f"📊 *Live Octolink:*\n\n{lines}\n\n"
         f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
@@ -308,9 +338,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     codes = last_known_codes
     if codes:
         lines = "\n".join(f"- `{c}`" for c in codes)
-        msg = f"📋 *Cache ({len(codes)} mã):*\n{lines}"
+        msg = f"📋 *Cache ({len(codes)} mã):*\n{lines}\n\n_(từ lần quét trước)_"
     else:
-        msg = "📋 Chưa có cache. Gõ /check"
+        msg = "📋 Chưa có cache. Gõ /check để quét."
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 # ======================== AUTO CHECK ========================
@@ -328,7 +358,8 @@ async def auto_check_task(context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_id,
                     text=(
                         f"⚠️ *CẢNH BÁO:* Thất bại *{consecutive_failures} lần liên tiếp*!\n"
-                        f"Kiểm tra mật khẩu hoặc site thay đổi."
+                        f"Kiểm tra: mật khẩu, IP, hoặc site thay đổi.\n"
+                        f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}"
                     ),
                     parse_mode="Markdown",
                 )
@@ -341,7 +372,7 @@ async def auto_check_task(context: ContextTypes.DEFAULT_TYPE):
     old_set = set(last_known_codes)
 
     if not old_set:
-        log.info(f"Lần đầu: cache {len(current_codes)} mã")
+        log.info(f"Lần đầu: cache {len(current_codes)} mã.")
         last_known_codes = current_codes
         save_state(current_codes)
         return
@@ -361,7 +392,7 @@ async def auto_check_task(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.error(f"Gửi thông báo lỗi: {e}")
     else:
-        log.info("Không đổi")
+        log.info("Không đổi.")
 
     last_known_codes = current_codes
     save_state(current_codes)
@@ -395,15 +426,15 @@ def main():
     app.add_handler(CommandHandler("check", check_command))
     app.add_handler(CommandHandler("status", status_command))
 
-    if app.job_queue and TARGET_CHAT_ID:
-        jq = app.job_queue
+    jq = app.job_queue
+    if jq and TARGET_CHAT_ID:
         jq.run_once(auto_check_task, when=10, data=TARGET_CHAT_ID)
         jq.run_repeating(auto_check_task, interval=CHECK_INTERVAL, first=CHECK_INTERVAL, data=TARGET_CHAT_ID)
-        log.info(f"✅ Auto-check mỗi {CHECK_INTERVAL}s")
+        log.info(f"✅ Auto-check mỗi {CHECK_INTERVAL}s → {TARGET_CHAT_ID}")
     else:
-        log.warning("job_queue không chạy!")
+        log.warning("job_queue không chạy hoặc chưa đặt TARGET_CHAT_ID!")
 
-    log.info("Bot sẵn sàng. /check để quét, /status xem cache")
+    log.info("Bot sẵn sàng. /check để quét, /status để xem cache.")
     try:
         app.run_polling(drop_pending_updates=True)
     finally:
