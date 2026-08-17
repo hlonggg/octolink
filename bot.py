@@ -1,6 +1,6 @@
 """
-Octolink Code Monitor Bot - v3.1
-Tối ưu cho Web Service + ping 10 phút
+Octolink Code Monitor Bot - v3.2
+Sửa port cho Render
 """
 
 import asyncio
@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import random
+import os
 from datetime import datetime
 from pathlib import Path
 from threading import Thread
@@ -360,7 +361,7 @@ async def auto_check_task(context: ContextTypes.DEFAULT_TYPE):
     last_known_codes = current_codes
     save_state(current_codes)
 
-# ======================== FLASK WEB SERVER (GIỮ BOT KHÔNG NGỦ) ========================
+# ======================== FLASK WEB SERVER ========================
 from flask import Flask, Response
 
 flask_app = Flask(__name__)
@@ -371,27 +372,28 @@ def health():
 
 @flask_app.route('/ping')
 def ping():
-    """Endpoint cho cron-job.org ping mỗi 10 phút"""
     return Response("pong", status=200, mimetype='text/plain')
 
 def run_flask():
-    flask_app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+    # Lấy port từ biến môi trường Render (mặc định 10000)
+    port = int(os.environ.get('PORT', 10000))
+    flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # ======================== MAIN ========================
 def main():
     log.info("🤖 Bot khởi động...")
 
-    # Chạy Flask trong thread riêng để giữ cổng HTTP luôn mở
+    # Chạy Flask trong thread riêng
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    log.info("✅ Flask web server chạy trên cổng 8080, ping /ping để giữ bot thức")
+    log.info(f"✅ Flask web server chạy trên cổng {os.environ.get('PORT', 10000)}, ping /ping để giữ bot thức")
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("check", check_command))
     app.add_handler(CommandHandler("status", status_command))
 
-    jq = app.job_queue
-    if jq and TARGET_CHAT_ID:
+    if app.job_queue and TARGET_CHAT_ID:
+        jq = app.job_queue
         jq.run_once(auto_check_task, when=10, data=TARGET_CHAT_ID)
         jq.run_repeating(auto_check_task, interval=CHECK_INTERVAL, first=CHECK_INTERVAL, data=TARGET_CHAT_ID)
         log.info(f"✅ Auto-check mỗi {CHECK_INTERVAL}s")
@@ -402,7 +404,10 @@ def main():
     try:
         app.run_polling(drop_pending_updates=True)
     finally:
-        asyncio.get_event_loop().run_until_complete(close_browser())
+        try:
+            asyncio.run(close_browser())
+        except RuntimeError:
+            pass
 
 if __name__ == "__main__":
     main()
