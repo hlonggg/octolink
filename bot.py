@@ -1,6 +1,6 @@
 """
-Octolink Code Monitor Bot - v3.2
-Sửa port cho Render
+Octolink Code Monitor Bot - v3.3
+Sửa login với thời gian chờ JS
 """
 
 import asyncio
@@ -125,9 +125,9 @@ async def ensure_logged_in(page: Page) -> bool:
     if _logged_in:
         try:
             await page.goto(TASKS_URL, wait_until="domcontentloaded", timeout=15_000)
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
             if "/login" not in page.url:
-                log.info(f"Session OK")
+                log.info("Session OK")
                 return True
             log.info("Session hết hạn, đăng nhập lại...")
         except Exception:
@@ -137,52 +137,57 @@ async def ensure_logged_in(page: Page) -> bool:
     log.info("Đăng nhập...")
     await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
 
+    # Chờ JS render
+    await asyncio.sleep(5)
+
+    # Chờ form login xuất hiện
     try:
-        await page.wait_for_selector("#email", state="visible", timeout=15_000)
-        await page.wait_for_selector("#password", state="visible", timeout=15_000)
+        await page.wait_for_selector('#email', state='visible', timeout=30_000)
+        await page.wait_for_selector('#password', state='visible', timeout=30_000)
+        log.info("Form login đã load")
     except PlaywrightTimeout:
-        log.error("Form login không xuất hiện!")
+        log.error("Form login không xuất hiện sau 30s")
+        try:
+            html = await page.content()
+            log.info(f"HTML đầu trang (500 ký tự): {html[:500]}")
+        except Exception:
+            pass
         return False
 
-    await page.locator("#email").click()
-    await page.locator("#email").fill("")
-    await page.locator("#email").type(MY_EMAIL, delay=30)
+    # Điền email
+    await page.locator('#email').click()
+    await page.locator('#email').fill("")
+    await page.locator('#email').type(MY_EMAIL, delay=50)
 
-    await page.locator("#password").click()
-    await page.locator("#password").fill("")
-    await page.locator("#password").type(MY_PASSWORD, delay=30)
+    # Điền password
+    await page.locator('#password').click()
+    await page.locator('#password').fill("")
+    await page.locator('#password').type(MY_PASSWORD, delay=50)
 
-    await asyncio.sleep(random.uniform(0.4, 0.8))
+    await asyncio.sleep(random.uniform(0.5, 1.0))
 
-    # Click submit
-    submitted = False
-    for btn_selector in [
-        "button[type='submit']",
-        "button:has-text('Đăng nhập')",
-        "input[type='submit']",
-    ]:
-        try:
-            btn = page.locator(btn_selector)
-            if await btn.count() > 0:
-                await btn.first.click()
-                submitted = True
-                break
-        except Exception:
-            continue
-
-    if not submitted:
-        await page.locator("#password").press("Enter")
+    # Click nút đăng nhập
+    try:
+        btn = page.locator('button[type="submit"]:has-text("Đăng nhập ngay")')
+        if await btn.count() > 0:
+            await btn.click()
+        else:
+            await page.click('button[type="submit"]')
+        log.info("Đã click nút đăng nhập")
+    except Exception as e:
+        log.warning(f"Click button lỗi: {e}")
+        await page.locator('#password').press("Enter")
 
     # Chờ thoát login
-    deadline = asyncio.get_event_loop().time() + 15
+    deadline = asyncio.get_event_loop().time() + 30
     while asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0.5)
         if "/login" not in page.url:
-            log.info(f"Đăng nhập thành công")
+            log.info(f"Đăng nhập thành công → {page.url}")
             _logged_in = True
             return True
 
-    log.error("Login timeout")
+    log.error("Login timeout 30s, vẫn ở /login")
     return False
 
 # ======================== SCRAPE ========================
@@ -202,14 +207,14 @@ def looks_like_code(t: str) -> bool:
 async def _scrape_codes(page: Page) -> list[str]:
     if "/tasks" not in page.url:
         await page.goto(TASKS_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(2)
 
     if "/login" in page.url:
         raise RuntimeError("Redirect về login")
 
     # Chờ element
     try:
-        await page.wait_for_selector(CODE_SELECTORS[0], timeout=10_000)
+        await page.wait_for_selector(CODE_SELECTORS[0], timeout=15_000)
     except PlaywrightTimeout:
         for sel in CODE_SELECTORS[1:]:
             try:
@@ -375,7 +380,6 @@ def ping():
     return Response("pong", status=200, mimetype='text/plain')
 
 def run_flask():
-    # Lấy port từ biến môi trường Render (mặc định 10000)
     port = int(os.environ.get('PORT', 10000))
     flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
@@ -383,7 +387,6 @@ def run_flask():
 def main():
     log.info("🤖 Bot khởi động...")
 
-    # Chạy Flask trong thread riêng
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     log.info(f"✅ Flask web server chạy trên cổng {os.environ.get('PORT', 10000)}, ping /ping để giữ bot thức")
