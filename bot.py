@@ -1,35 +1,44 @@
 """
-Octolink Code Monitor Bot - v3.4
-Dựa trên file dmm.py - cơ chế login và scrape ổn định
+Octolink Code Monitor Bot - v3.0
+Tối ưu tốc độ: reuse browser, block assets, JS batch query, bỏ networkidle
 """
 
 import asyncio
 import json
 import logging
+import os
 import re
 import random
-import os
+import sys
 from datetime import datetime
 from pathlib import Path
-from threading import Thread
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeout
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ======================== CẤU HÌNH ========================
-BOT_TOKEN      = "8801698234:AAFJQACza2NqYnYs0CKvmTP8-F4S7ZOyK-c"
-MY_EMAIL       = "hoanglongphan711@gmail.com"
-MY_PASSWORD    = "longdzvcl12@"
-LOGIN_URL      = "https://kiemcom.site/login"
-TASKS_URL      = "https://kiemcom.site/dashboard/tasks"
-TARGET_CHAT_ID = "-1003948095853"
+# Toàn bộ thông tin nhạy cảm được đọc từ biến môi trường (Railway → Variables).
+# KHÔNG hardcode token/mật khẩu trong code khi đẩy lên GitHub.
+BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
+MY_EMAIL       = os.environ.get("MY_EMAIL", "")
+MY_PASSWORD    = os.environ.get("MY_PASSWORD", "")
+LOGIN_URL      = os.environ.get("LOGIN_URL", "https://kiemcom.site/login")
+TASKS_URL      = os.environ.get("TASKS_URL", "https://kiemcom.site/dashboard/tasks")
+TARGET_CHAT_ID = os.environ.get("TARGET_CHAT_ID", "")
 
-CHECK_INTERVAL  = 300     # giây
-MAX_RETRIES     = 3
-RETRY_DELAY     = 10
-PAGE_TIMEOUT    = 30_000
-STATE_FILE      = "bot_state.json"
+CHECK_INTERVAL  = int(os.environ.get("CHECK_INTERVAL", "300"))   # giây
+MAX_RETRIES     = int(os.environ.get("MAX_RETRIES", "3"))
+RETRY_DELAY     = int(os.environ.get("RETRY_DELAY", "10"))       # giây
+PAGE_TIMEOUT    = int(os.environ.get("PAGE_TIMEOUT", "30000"))   # ms
+STATE_FILE      = os.environ.get("STATE_FILE", "bot_state.json")
+
+_REQUIRED_VARS = ["BOT_TOKEN", "MY_EMAIL", "MY_PASSWORD", "TARGET_CHAT_ID"]
+_missing = [v for v in _REQUIRED_VARS if not os.environ.get(v)]
+if _missing:
+    print(f"❌ Thiếu biến môi trường bắt buộc: {', '.join(_missing)}. "
+          f"Hãy khai báo trong Railway → Variables.", file=sys.stderr)
+    sys.exit(1)
 
 # ======================== LOGGING ========================
 logging.basicConfig(
@@ -55,16 +64,17 @@ def save_state(codes: list[str]):
     try:
         Path(STATE_FILE).write_text(json.dumps(codes, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
-        log.warning(f"Không lưu state: {e}")
+        log.warning(f"Không lưu được state: {e}")
 
 last_known_codes: list[str] = load_state()
-consecutive_failures: int = 0
+consecutive_failures: int   = 0
 
 # ======================== BROWSER SINGLETON ========================
+# Reuse browser + context thay vì khởi động lại mỗi lần → tiết kiệm 3-5s
 _playwright = None
 _browser: Browser | None = None
 _context: BrowserContext | None = None
-_logged_in: bool = False
+_logged_in: bool = False   # track session còn sống không
 
 async def get_browser_context() -> tuple[Browser, BrowserContext]:
     global _playwright, _browser, _context
@@ -72,7 +82,7 @@ async def get_browser_context() -> tuple[Browser, BrowserContext]:
     if _browser and _browser.is_connected() and _context:
         return _browser, _context
 
-    log.info("Khởi động browser...")
+    log.info("Khởi động browser lần đầu...")
     _playwright = await async_playwright().start()
     _browser = await _playwright.chromium.launch(
         headless=True,
@@ -94,7 +104,7 @@ async def get_browser_context() -> tuple[Browser, BrowserContext]:
         viewport={"width": 1280, "height": 800},
     )
 
-    # Block ảnh, font, media, stylesheet → load nhanh hơn
+    # Block ảnh, font, media, ads → trang load nhanh hơn ~40%
     await _context.route(
         "**/*",
         lambda route: route.abort()
@@ -103,6 +113,7 @@ async def get_browser_context() -> tuple[Browser, BrowserContext]:
     )
 
     return _browser, _context
+
 
 async def close_browser():
     global _browser, _context, _playwright, _logged_in
@@ -118,10 +129,12 @@ async def close_browser():
     _browser = _context = _playwright = None
     _logged_in = False
 
+
 # ======================== LOGIN ========================
 async def ensure_logged_in(page: Page) -> bool:
     global _logged_in
 
+    # Kiểm tra session còn sống: vào dashboard, nếu bị redirect về login thì re-login
     if _logged_in:
         try:
             await page.goto(TASKS_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
@@ -137,10 +150,7 @@ async def ensure_logged_in(page: Page) -> bool:
     log.info("Mở trang login...")
     await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
 
-    # Chờ JS render
-    await asyncio.sleep(3)
-
-    # Chờ form load
+    # Chờ form load hoàn toàn
     try:
         await page.wait_for_selector("#email", state="visible", timeout=PAGE_TIMEOUT)
         await page.wait_for_selector("#password", state="visible", timeout=PAGE_TIMEOUT)
@@ -160,13 +170,13 @@ async def ensure_logged_in(page: Page) -> bool:
 
     await asyncio.sleep(random.uniform(0.4, 0.8))
 
-    # Click nút submit
+    # Click nút submit (thử nhiều cách)
     submitted = False
     for btn_selector in [
         "button[type='submit']",
         "button:has-text('Đăng nhập')",
-        "button:has-text('Đăng nhập ngay')",
         "input[type='submit']",
+        "button:has-text('Login')",
     ]:
         try:
             btn = page.locator(btn_selector)
@@ -178,32 +188,35 @@ async def ensure_logged_in(page: Page) -> bool:
         except Exception:
             continue
 
+    # Fallback: press Enter
     if not submitted:
         log.info("Không tìm thấy nút submit, thử Enter...")
         await page.locator("#password").press("Enter")
 
-    # Chờ thoát login
-    deadline = asyncio.get_event_loop().time() + 20
+    # Chờ trang chuyển — KHÔNG dùng wait_for_url vì có thể redirect qua nhiều bước
+    # Thay bằng: poll URL cho đến khi thoát khỏi /login
+    deadline = asyncio.get_event_loop().time() + 15  # chờ tối đa 15s
     while asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0.5)
         current = page.url
         if "/login" not in current:
-            log.info(f"Thoát login → {current}")
+            log.info(f"Thoát khỏi login → {current}")
             break
-        # Kiểm tra lỗi
+        # Kiểm tra có thông báo lỗi không
         err_sel = ".error, .alert-danger, [class*='error'], [class*='invalid']"
         try:
             err = page.locator(err_sel)
             if await err.count() > 0:
                 err_text = await err.first.inner_text()
-                log.error(f"Login thất bại: {err_text.strip()}")
+                log.error(f"Login thất bại, thông báo lỗi: {err_text.strip()}")
                 return False
         except Exception:
             pass
     else:
-        log.error(f"Timeout 20s, vẫn ở login: {page.url}")
+        log.error(f"Timeout 15s, vẫn ở login: {page.url}")
         return False
 
+    # Xác nhận chắc chắn đã vào dashboard
     await asyncio.sleep(0.5)
     if "/login" in page.url:
         log.error(f"Vẫn ở login sau khi submit: {page.url}")
@@ -212,6 +225,7 @@ async def ensure_logged_in(page: Page) -> bool:
     log.info(f"✅ Đăng nhập thành công → {page.url}")
     _logged_in = True
     return True
+
 
 # ======================== SCRAPE ========================
 CODE_SELECTORS = [
@@ -227,19 +241,24 @@ def looks_like_code(t: str) -> bool:
     t = t.strip()
     return bool(t and CODE_PATTERN.match(t))
 
+
 async def _scrape_codes(page: Page) -> list[str]:
+    """Vào tasks và lấy mã — tất cả trong 1 JS evaluate call."""
+
     if "/tasks" not in page.url:
         await page.goto(TASKS_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
 
+    # Guard: nếu bị redirect về login thì raise để trigger retry + re-login
     if "/login" in page.url:
-        raise RuntimeError(f"Bị redirect về login: {page.url}")
+        raise RuntimeError(f"Bị redirect về login khi vào tasks: {page.url}")
 
-    # Chờ element
+    # Chờ đúng element cần thiết, không chờ toàn bộ network
     target_sel = CODE_SELECTORS[0]
     try:
         await page.wait_for_selector(target_sel, timeout=10_000)
     except PlaywrightTimeout:
+        # Thử selector rộng hơn
         for sel in CODE_SELECTORS[1:]:
             try:
                 await page.wait_for_selector(sel, timeout=5_000)
@@ -248,7 +267,7 @@ async def _scrape_codes(page: Page) -> list[str]:
             except PlaywrightTimeout:
                 continue
 
-    # Lấy text bằng JS
+    # Lấy tất cả text trong 1 JS call — nhanh hơn loop Python nhiều
     texts: list[str] = await page.evaluate(f"""
         () => {{
             const selectors = {json.dumps(CODE_SELECTORS)};
@@ -264,7 +283,7 @@ async def _scrape_codes(page: Page) -> list[str]:
 
     codes = list(dict.fromkeys(t for t in texts if looks_like_code(t)))
 
-    # Fallback regex
+    # Fallback: regex trên HTML nếu JS call trả về rỗng
     if not codes:
         log.warning("JS query rỗng, fallback regex HTML...")
         html = await page.content()
@@ -274,7 +293,8 @@ async def _scrape_codes(page: Page) -> list[str]:
     log.info(f"Tìm được {len(codes)} mã.")
     return codes
 
-# ======================== MAIN SCRAPE ========================
+
+# ======================== MAIN SCRAPE ENTRY ========================
 async def get_octolink_codes() -> list[str]:
     global consecutive_failures, _logged_in
 
@@ -297,13 +317,14 @@ async def get_octolink_codes() -> list[str]:
 
         except Exception as e:
             log.warning(f"Lần {attempt} lỗi: {e}")
-            _logged_in = False
+            _logged_in = False  # force re-login lần sau
             try:
                 if page:
                     await page.close()
             except Exception:
                 pass
 
+            # Nếu browser crash, reset hẳn
             if "Target page, context or browser has been closed" in str(e):
                 await close_browser()
 
@@ -314,6 +335,7 @@ async def get_octolink_codes() -> list[str]:
     consecutive_failures += 1
     log.error(f"Thất bại {consecutive_failures} lần liên tiếp.")
     return []
+
 
 # ======================== TELEGRAM ========================
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -334,6 +356,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     codes = last_known_codes
     if codes:
@@ -342,6 +365,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg = "📋 Chưa có cache. Gõ /check để quét."
     await update.message.reply_text(msg, parse_mode="Markdown")
+
 
 # ======================== AUTO CHECK ========================
 async def auto_check_task(context: ContextTypes.DEFAULT_TYPE):
@@ -369,7 +393,7 @@ async def auto_check_task(context: ContextTypes.DEFAULT_TYPE):
         return
 
     current_set = set(current_codes)
-    old_set = set(last_known_codes)
+    old_set     = set(last_known_codes)
 
     if not old_set:
         log.info(f"Lần đầu: cache {len(current_codes)} mã.")
@@ -378,7 +402,7 @@ async def auto_check_task(context: ContextTypes.DEFAULT_TYPE):
         return
 
     if current_set != old_set:
-        new_items = current_set - old_set
+        new_items     = current_set - old_set
         removed_items = old_set - current_set
         parts = ["🚨 *THAY ĐỔI MÃ SỐ!*\n"]
         if new_items:
@@ -397,33 +421,12 @@ async def auto_check_task(context: ContextTypes.DEFAULT_TYPE):
     last_known_codes = current_codes
     save_state(current_codes)
 
-# ======================== FLASK WEB SERVER ========================
-from flask import Flask, Response
-
-flask_app = Flask(__name__)
-
-@flask_app.route('/')
-def health():
-    return Response("Bot is running", status=200, mimetype='text/plain')
-
-@flask_app.route('/ping')
-def ping():
-    return Response("pong", status=200, mimetype='text/plain')
-
-def run_flask():
-    port = int(os.environ.get('PORT', 10000))
-    flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # ======================== MAIN ========================
 def main():
     log.info("🤖 Bot khởi động...")
-
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    log.info(f"✅ Flask web server chạy trên cổng {os.environ.get('PORT', 10000)}, ping /ping để giữ bot thức")
-
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("check", check_command))
+    app.add_handler(CommandHandler("check",  check_command))
     app.add_handler(CommandHandler("status", status_command))
 
     jq = app.job_queue
@@ -438,10 +441,9 @@ def main():
     try:
         app.run_polling(drop_pending_updates=True)
     finally:
-        try:
-            asyncio.run(close_browser())
-        except RuntimeError:
-            pass
+        # Đóng browser khi tắt bot
+        asyncio.get_event_loop().run_until_complete(close_browser())
+
 
 if __name__ == "__main__":
     main()
